@@ -90,7 +90,7 @@ z  7  8  9
 
 ## Data
 
-- [x] **Data acquisition**: Supports various data providers, such as **[Yahoo Finance](https://github.com/ranaroussi/yfinance)**, **[Binance](https://github.com/sammchardy/python-binance)**, **[CCXT](https://github.com/ccxt/ccxt)** and **[Alpaca](https://github.com/alpacahq/alpaca-trade-api-python)**. Can merge multiple symbols with different index, as well as update them.
+- [x] **Data acquisition**: Supports various data providers, such as **[Yahoo Finance](https://github.com/ranaroussi/yfinance)**, **[Binance](https://github.com/sammchardy/python-binance)**, **[CCXT](https://github.com/ccxt/ccxt)**, **[Alpaca](https://github.com/alpacahq/alpaca-trade-api-python)** and **[Aperiodic](https://aperiodic.io)** (historical and live crypto perpetuals with trade, order book and derivative metrics). Can merge multiple symbols with different index, as well as update them.
 
 ```pycon title="Download Alpaca data"
 >>> alpaca_data = vbt.AlpacaData.download(

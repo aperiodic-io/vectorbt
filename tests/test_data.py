@@ -1021,3 +1021,214 @@ class TestDataUpdater:
             data = data.update()
         assert updater.data == data
         assert updater.config["data"] == data
+
+
+# ############# custom.py ############# #
+
+
+class FakeAperiodic:
+    """Stand-in for the `aperiodic` package: deterministic bars, metrics and stream messages."""
+
+    def __init__(self, messages=()):
+        self.calls = []
+        self.messages = list(messages)
+        self.stream_args = None
+        self.closed = False
+
+    @staticmethod
+    def bars(symbol, start, end, freq="1h"):
+        index = pd.date_range(start, end, freq=freq, inclusive="left")
+        base = 100.0 if "BTC" in symbol else 10.0
+        close = base + np.arange(len(index), dtype=float)
+        return pd.DataFrame(
+            {
+                "time": index.tz_localize(None),
+                "open": close - 0.5,
+                "high": close + 1.0,
+                "low": close - 1.0,
+                "close": close,
+                "volume": np.full(len(index), 2.0, dtype=np.float32),
+                "volume_notional": (close * 2).astype(np.float32),
+            }
+        )
+
+    def _bars(self, kwargs):
+        start = pd.Timestamp(kwargs["start_date"])
+        end = pd.Timestamp(kwargs["end_date"]) + pd.Timedelta(days=1)
+        return self.bars(kwargs["symbol"], start, end, kwargs["interval"])
+
+    def get_ohlcv(self, **kwargs):
+        self.calls.append(("ohlcv", kwargs))
+        return self._bars(kwargs)
+
+    def get_derivative_metrics(self, **kwargs):
+        self.calls.append((kwargs["metric"], kwargs))
+        df = self._bars(kwargs)[["time"]]
+        df["funding_rate"] = np.float32(0.0001)
+        return df
+
+    def get_metrics(self, **kwargs):
+        self.calls.append((kwargs["metric"], kwargs))
+        df = self._bars(kwargs)[["time"]]
+        df["volume_delta"] = 1.5
+        return df
+
+    def stream(self, api_key, **kwargs):
+        from types import SimpleNamespace
+
+        self.stream_args = dict(api_key=api_key, **kwargs)
+        fake = self
+
+        class Stream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc_info):
+                fake.closed = True
+
+            def __iter__(self):
+                for channel, data, snapshot in fake.messages:
+                    yield SimpleNamespace(channel=channel, data=data, snapshot=snapshot)
+
+        return Stream()
+
+
+def aperiodic_row(symbol, time, close):
+    return dict(
+        symbol=symbol,
+        interval="1h",
+        time=int(pd.Timestamp(time, tz="UTC").value // 1000),
+        open=close - 0.5,
+        high=close + 1.0,
+        low=close - 1.0,
+        close=close,
+        volume=2.0,
+        volume_notional=close * 2,
+    )
+
+
+@pytest.fixture
+def fake_aperiodic(monkeypatch):
+    import sys
+
+    fake = FakeAperiodic()
+    monkeypatch.setitem(sys.modules, "aperiodic", fake)
+    monkeypatch.delenv("APERIODIC_API_KEY", raising=False)
+    return fake
+
+
+BTC = "perpetual-BTC-USDT:USDT"
+ETH = "perpetual-ETH-USDT:USDT"
+CHANNEL = "ohlcv.binance-futures.1h"
+
+
+class TestAperiodicData:
+    def test_download(self, fake_aperiodic):
+        data = vbt.AperiodicData.download(
+            BTC, start="2026-09-01 06:00 UTC", end="2026-09-02 00:00 UTC", interval="1h", api_key="key"
+        )
+        df = data.data[BTC]
+        assert list(df.columns) == ["Open", "High", "Low", "Close", "Volume", "Quote volume"]
+        assert (df.dtypes == np.float64).all()
+        assert df.index.name == "Open time"
+        assert str(df.index.tz) == "UTC"
+        assert df.index[0] == pd.Timestamp("2026-09-01 06:00", tz="UTC")
+        assert df.index[-1] == pd.Timestamp("2026-09-01 23:00", tz="UTC")
+        _, kwargs = fake_aperiodic.calls[0]
+        assert kwargs["start_date"] == kwargs["end_date"] == pd.Timestamp("2026-09-01").date()
+        assert kwargs["api_key"] == "key"
+        assert kwargs["output"] == "pandas"
+
+    def test_download_empty_range(self, fake_aperiodic):
+        df = vbt.AperiodicData.download_symbol(BTC, start="2026-09-02 UTC", end="2026-09-01 UTC")
+        assert df.empty
+        assert list(df.columns) == ["Open", "High", "Low", "Close", "Volume", "Quote volume"]
+        assert fake_aperiodic.calls == []
+
+    def test_download_metrics(self, fake_aperiodic):
+        data = vbt.AperiodicData.download(
+            [BTC, ETH],
+            start="2026-09-01 UTC",
+            end="2026-09-02 UTC",
+            metrics=["funding", "flow"],
+        )
+        assert [c[0] for c in fake_aperiodic.calls] == ["ohlcv", "funding", "flow"] * 2
+        funding = data.get("funding_rate")
+        assert list(funding.columns) == [BTC, ETH]
+        assert funding.dtypes.eq(np.float64).all()
+        np.testing.assert_allclose(funding.values, np.float32(0.0001))
+        np.testing.assert_array_equal(data.get("volume_delta").values, 1.5)
+
+    def test_api_key_resolution(self, fake_aperiodic, monkeypatch):
+        assert vbt.AperiodicData.resolve_api_key("arg") == "arg"
+        monkeypatch.setenv("APERIODIC_API_KEY", "env")
+        assert vbt.AperiodicData.resolve_api_key() == "env"
+        vbt.settings.data["aperiodic"]["api_key"] = "settings"
+        try:
+            assert vbt.AperiodicData.resolve_api_key() == "settings"
+        finally:
+            vbt.settings.data["aperiodic"]["api_key"] = None
+
+    def test_update(self, fake_aperiodic):
+        data = vbt.AperiodicData.download(BTC, start="2026-09-01 UTC", end="2026-09-01 12:00 UTC")
+        new_data = data.update(end="2026-09-01 18:00 UTC")
+        _, kwargs = fake_aperiodic.calls[-1]
+        assert kwargs["show_progress"] is False
+        assert len(new_data.wrapper.index) == 18
+        assert new_data.wrapper.index[-1] == pd.Timestamp("2026-09-01 17:00", tz="UTC")
+        pd.testing.assert_frame_equal(new_data.data[BTC].iloc[:12], data.data[BTC], check_freq=False)
+
+    def test_stream(self, fake_aperiodic):
+        data = vbt.AperiodicData.download(
+            [BTC, ETH], start="2026-09-01 UTC", end="2026-09-01 03:00 UTC", metrics="funding", api_key="key"
+        )
+        fake_aperiodic.messages = [
+            (CHANNEL, aperiodic_row(BTC, "2026-09-01 02:00", 102.0), True),  # snapshot of a known bar
+            (CHANNEL, aperiodic_row(BTC, "2026-09-01 03:00", 200.0), False),
+            (CHANNEL, aperiodic_row(BTC, "2026-09-01 04:00", 201.0), False),  # ETH lags behind
+            (CHANNEL, aperiodic_row(ETH, "2026-09-01 03:00", 20.0), False),
+            (CHANNEL, aperiodic_row(ETH, "2026-09-01 04:00", 21.0), False),
+            ("ohlcv.okx-perps.1h", aperiodic_row(BTC, "2026-09-01 05:00", 0.0), False),  # not subscribed
+        ]
+        updates = list(data.stream())
+        assert fake_aperiodic.closed
+        assert fake_aperiodic.stream_args["api_key"] == "key"
+        assert fake_aperiodic.stream_args["channels"] == [
+            dict(dataset="ohlcv", exchange="binance-futures", interval="1h", symbols=[BTC, ETH])
+        ]
+        assert [u.wrapper.index[-1].hour for u in updates] == [3, 4]
+        close = updates[-1].get("Close")
+        assert close.loc["2026-09-01 03:00", BTC] == 200.0
+        assert close.loc["2026-09-01 04:00", ETH] == 21.0
+        assert len(close) == 5
+        assert not close.isna().any().any()
+        funding = updates[-1].get("funding_rate")
+        assert funding.iloc[:3].notna().all().all()
+        assert funding.iloc[3:].isna().all().all()
+
+    def test_stream_backfill(self, fake_aperiodic):
+        data = vbt.AperiodicData.download(BTC, start="2026-09-01 UTC", end="2026-09-01 03:00 UTC")
+        fake_aperiodic.messages = [(CHANNEL, aperiodic_row(BTC, "2026-09-01 06:00", 300.0), False)]
+        (update,) = list(data.stream())
+        close = update.get("Close")
+        assert list(close.index.hour) == [0, 1, 2, 3, 4, 5, 6]
+        assert list(close.iloc[3:6]) == [103.0, 104.0, 105.0]  # from REST
+        assert close.iloc[-1] == 300.0
+        _, kwargs = fake_aperiodic.calls[-1]
+        assert kwargs["start_date"] == kwargs["end_date"] == pd.Timestamp("2026-09-01").date()
+
+        (update,) = list(data.stream(backfill=False))
+        assert list(update.get("Close").index.hour) == [0, 1, 2, 6]
+
+    def test_stream_backfill_keeps_other_symbols(self, fake_aperiodic):
+        data = vbt.AperiodicData.download([BTC, ETH], start="2026-09-01 UTC", end="2026-09-01 03:00 UTC")
+        fake_aperiodic.messages = [
+            (CHANNEL, aperiodic_row(ETH, "2026-09-01 04:00", 24.0), True),
+            (CHANNEL, aperiodic_row(BTC, "2026-09-01 05:00", 205.0), False),
+            (CHANNEL, aperiodic_row(ETH, "2026-09-01 05:00", 25.0), False),
+        ]
+        updates = list(data.stream())
+        close = updates[-1].get("Close")
+        assert list(close.index.hour) == [0, 1, 2, 3, 4, 5]
+        assert list(close[ETH]) == [10.0, 11.0, 12.0, 13.0, 24.0, 25.0]
+        assert list(close[BTC]) == [100.0, 101.0, 102.0, 103.0, 104.0, 205.0]

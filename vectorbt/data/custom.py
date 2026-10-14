@@ -21,7 +21,7 @@ import pandas as pd
 from tqdm.auto import tqdm
 
 from vectorbt import _typing as tp
-from vectorbt.data.base import Data
+from vectorbt.data.base import Data, symbol_dict
 from vectorbt.utils.config import merge_dicts, get_func_kwargs
 from vectorbt.utils.datetime_ import get_utc_tz, get_local_tz, to_tzaware_datetime, datetime_to_ms
 
@@ -951,3 +951,335 @@ class AlpacaData(Data):
         download_kwargs["show_progress"] = False
         kwargs = merge_dicts(download_kwargs, kwargs)
         return self.download_symbol(symbol, **kwargs)
+
+
+AperiodicDataT = tp.TypeVar("AperiodicDataT", bound="AperiodicData")
+
+_APERIODIC_COLUMNS = {
+    "open": "Open",
+    "high": "High",
+    "low": "Low",
+    "close": "Close",
+    "volume": "Volume",
+    "volume_notional": "Quote volume",
+}
+_APERIODIC_DERIVATIVE_METRICS = ("basis", "funding", "open_interest", "derivative_price")
+
+
+class AperiodicData(Data):
+    """`Data` for data coming from `aperiodic`.
+
+    [Aperiodic](https://aperiodic.io) serves aggregated crypto market data for perpetual futures
+    on Binance, OKX and Hyperliquid: OHLCV bars plus trade, order book and derivative metrics, both
+    historically over REST and live over WebSocket. Symbols follow the
+    [Atlas](https://github.com/aperiodic-io/atlas) symbology, such as `perpetual-BTC-USDT:USDT`.
+
+    Requires `pip install "aperiodic[pandas,stream]"` and an API key, passed as `api_key`, set under
+    `data.aperiodic` in `vectorbt._settings.settings`, or read from the `APERIODIC_API_KEY`
+    environment variable. Live streaming with `AperiodicData.stream` requires a plan with live data.
+
+    Usage:
+        * Fetch hourly bars of two perpetuals together with their funding rates:
+
+        ```pycon
+        >>> import vectorbt as vbt
+
+        >>> aperiodic_data = vbt.AperiodicData.download(
+        ...     ["perpetual-BTC-USDT:USDT", "perpetual-ETH-USDT:USDT"],
+        ...     start='2026-09-01 UTC',
+        ...     end='2026-10-01 UTC',
+        ...     interval='1h',
+        ...     metrics='funding'
+        ... )
+        >>> aperiodic_data.get('Close')
+        symbol                     perpetual-BTC-USDT:USDT  perpetual-ETH-USDT:USDT
+        Open time
+        2026-09-01 00:00:00+00:00                  78618.0                  2470.75
+        2026-09-01 01:00:00+00:00                  78375.7                  2461.77
+        2026-09-01 02:00:00+00:00                  78420.7                  2463.83
+        ...                                            ...                      ...
+        2026-09-30 21:00:00+00:00                  83720.0                  2682.97
+        2026-09-30 22:00:00+00:00                  83648.0                  2685.68
+        2026-09-30 23:00:00+00:00                  83576.9                  2684.68
+
+        [720 rows x 2 columns]
+
+        >>> aperiodic_data.get('funding_rate')
+        symbol                     perpetual-BTC-USDT:USDT  perpetual-ETH-USDT:USDT
+        Open time
+        2026-09-01 00:00:00+00:00                 0.000079                 0.000060
+        2026-09-01 01:00:00+00:00                 0.000073                 0.000058
+        2026-09-01 02:00:00+00:00                 0.000080                 0.000069
+        ...                                            ...                      ...
+        2026-09-30 21:00:00+00:00                 0.000091                 0.000036
+        2026-09-30 22:00:00+00:00                 0.000088                 0.000056
+        2026-09-30 23:00:00+00:00                 0.000080                 0.000057
+
+        [720 rows x 2 columns]
+        ```
+
+        * Append the bars published since the last update:
+
+        ```pycon
+        >>> aperiodic_data = aperiodic_data.update()
+        ```
+
+        * Stream live bars, receiving an updated copy of the data once every symbol has a new bar:
+
+        ```pycon
+        >>> aperiodic_data = vbt.AperiodicData.download(
+        ...     "perpetual-BTC-USDT:USDT",
+        ...     start='1 day ago UTC',
+        ...     interval='1m'
+        ... )
+        >>> for aperiodic_data in aperiodic_data.stream():
+        ...     fast_ma = vbt.MA.run(aperiodic_data.get('Close'), 10)
+        ...     slow_ma = vbt.MA.run(aperiodic_data.get('Close'), 30)
+        ...     if fast_ma.ma_crossed_above(slow_ma).iloc[-1]:
+        ...         print(aperiodic_data.wrapper.index[-1], 'entry')
+        ```
+    """
+
+    @classmethod
+    def resolve_api_key(cls, api_key: tp.Optional[str] = None) -> tp.Optional[str]:
+        """Resolve the API key from the argument, then `data.aperiodic` settings, then `APERIODIC_API_KEY`."""
+        import os
+        from vectorbt._settings import settings
+
+        if api_key is None:
+            api_key = settings["data"]["aperiodic"]["api_key"]
+        if api_key is None:
+            api_key = os.environ.get("APERIODIC_API_KEY")
+        return api_key
+
+    @classmethod
+    def download_symbol(
+        cls,
+        symbol: str,
+        exchange: str = "binance-futures",
+        interval: str = "1h",
+        start: tp.DatetimeLike = "30 days ago UTC",
+        end: tp.DatetimeLike = "now UTC",
+        timestamp: str = "exchange",
+        metrics: tp.Optional[tp.MaybeSequence[str]] = None,
+        api_key: tp.Optional[str] = None,
+        show_progress: bool = False,
+        rows: tp.Optional[tp.Frame] = None,
+        **kwargs,
+    ) -> tp.Frame:
+        """Download the symbol.
+
+        Args:
+            symbol (str): Symbol in the Atlas symbology, such as `perpetual-BTC-USDT:USDT`.
+            exchange (str): Exchange, such as `binance-futures`, `okx-perps` or `hyperliquid-perps`.
+            interval (str): Bar interval, such as `1m`, `5m`, `15m`, `30m`, `1h`, `4h` or `1d`.
+            start (any): Start datetime (inclusive), compared against the bar open time.
+
+                See `vectorbt.utils.datetime_.to_tzaware_datetime`.
+
+                !!! note
+                    The available history depends on the plan.
+            end (any): End datetime (exclusive), compared against the bar open time.
+
+                See `vectorbt.utils.datetime_.to_tzaware_datetime`.
+            timestamp (str): Timestamp source: `exchange` for exchange-reported time or `true`
+                for the arrival time at Aperiodic.
+            metrics (str or sequence of str): Metrics to join as additional columns, such as `funding`,
+                `open_interest`, `basis`, `flow`, `l1_imbalance` or `l2_liquidity`.
+
+                Each metric contributes all of its columns (for example, `funding` adds `funding_rate`),
+                stamped with the interval start time like the bars.
+            api_key (str): API key. See `AperiodicData.resolve_api_key`.
+            show_progress (bool): Whether to show the download progress bar.
+            rows (pd.DataFrame): Rows to return instead of downloading them.
+
+                Used by `AperiodicData.stream` to append streamed bars through `Data.update`.
+            **kwargs: Keyword arguments passed to `aperiodic.get_ohlcv`, such as `base_url` or `preview`.
+
+        For defaults, see `data.aperiodic` in `vectorbt._settings.settings`.
+        """
+        if rows is not None:
+            return rows
+
+        import aperiodic
+
+        api_key = cls.resolve_api_key(api_key)
+        start_ts = pd.Timestamp(to_tzaware_datetime(start, tz=get_utc_tz()))
+        end_ts = pd.Timestamp(to_tzaware_datetime(end, tz=get_utc_tz()))
+        start_date = start_ts.date()
+        end_date = (end_ts - pd.Timedelta(microseconds=1)).date()
+        empty = pd.DataFrame(
+            columns=list(_APERIODIC_COLUMNS.values()),
+            index=pd.DatetimeIndex([], tz="UTC", name="Open time"),
+            dtype=float,
+        )
+        if start_ts >= end_ts:
+            return empty
+
+        def _fetch(func, **fetch_kwargs):
+            df = func(
+                api_key=api_key,
+                timestamp=timestamp,
+                interval=interval,
+                exchange=exchange,
+                symbol=symbol,
+                start_date=start_date,
+                end_date=end_date,
+                output="pandas",
+                show_progress=show_progress,
+                **fetch_kwargs,
+            )
+            if len(df) == 0:
+                return None
+            df = df.set_index(pd.DatetimeIndex(pd.to_datetime(df["time"], utc=True), name="Open time"))
+            del df["time"]
+            df = df[(df.index >= start_ts) & (df.index < end_ts)].sort_index()
+            return df[~df.index.duplicated(keep="last")]
+
+        df = _fetch(aperiodic.get_ohlcv, **kwargs)
+        if df is None:
+            return empty
+        df = df.rename(columns=_APERIODIC_COLUMNS)
+        df = df[[c for c in _APERIODIC_COLUMNS.values() if c in df.columns]].astype(float)
+
+        if metrics is not None:
+            if isinstance(metrics, str):
+                metrics = [metrics]
+            for metric in metrics:
+                if metric in _APERIODIC_DERIVATIVE_METRICS:
+                    metric_df = _fetch(aperiodic.get_derivative_metrics, metric=metric)
+                else:
+                    metric_df = _fetch(aperiodic.get_metrics, metric=metric)
+                if metric_df is not None:
+                    numeric_columns = metric_df.select_dtypes("number").columns
+                    metric_df[numeric_columns] = metric_df[numeric_columns].astype(float)
+                    df = df.join(metric_df, rsuffix="_" + metric)
+        return df
+
+    def update_symbol(self, symbol: str, **kwargs) -> tp.Frame:
+        """Update the symbol.
+
+        `**kwargs` will override keyword arguments passed to `AperiodicData.download_symbol`."""
+        download_kwargs = self.select_symbol_kwargs(symbol, self.download_kwargs)
+        download_kwargs["start"] = self.data[symbol].index[-1]
+        download_kwargs["end"] = "now UTC"
+        download_kwargs["show_progress"] = False
+        kwargs = merge_dicts(download_kwargs, kwargs)
+        return self.download_symbol(symbol, **kwargs)
+
+    def stream(
+        self: AperiodicDataT,
+        snapshot: bool = True,
+        reconnect: bool = True,
+        backfill: bool = True,
+        stream_url: tp.Optional[str] = None,
+    ) -> tp.Generator[AperiodicDataT, None, None]:
+        """Stream live bars over WebSocket and yield the updated data whenever every symbol has a new bar.
+
+        Subscribes to the OHLCV channel of each symbol's exchange and interval using `aperiodic.stream`.
+        A bar time is released once every symbol has delivered a bar at that time or later, so
+        the yielded data never has rows that are filled for some symbols only because the others
+        have yet to arrive. Bars that are already in the data, such as the snapshot rows sent
+        right after subscribing, are skipped.
+
+        Delivery is at-most-once: bars published while the connection is down are not replayed.
+        If `backfill` is True, a bar arriving more than one interval after the previous one
+        (after a reconnect, or when the stream starts after the end of the REST history) is
+        preceded by the missing bars from REST, as far as they have already been published.
+
+        Metric columns requested with `metrics` are not streamed; they stay NaN for streamed rows
+        until the data is updated over REST.
+
+        Leaving the loop closes the connection.
+
+        Args:
+            snapshot (bool): Whether to use the latest bar per symbol sent right after subscribing.
+            reconnect (bool): Whether to reconnect dropped connections.
+            backfill (bool): Whether to fill gaps between bars from REST.
+            stream_url (str): Stream endpoint. Defaults to the one of `aperiodic.stream`.
+        """
+        import aperiodic
+
+        channels = {}
+        routes = {}
+        freqs = {}
+        api_key = None
+        for symbol in self.symbols:
+            symbol_kwargs = self.select_symbol_kwargs(symbol, self.download_kwargs)
+            exchange = symbol_kwargs.get("exchange", "binance-futures")
+            interval = symbol_kwargs.get("interval", "1h")
+            if symbol_kwargs.get("timestamp", "exchange") != "exchange":
+                raise ValueError("Only data with exchange timestamps can be streamed")
+            if api_key is None:
+                api_key = self.resolve_api_key(symbol_kwargs.get("api_key", None))
+            channel = f"ohlcv.{exchange}.{interval}"
+            channels.setdefault(channel, dict(dataset="ohlcv", exchange=exchange, interval=interval, symbols=[]))
+            channels[channel]["symbols"].append(symbol)
+            routes[(channel, symbol)] = symbol
+            freqs[symbol] = pd.Timedelta(interval)
+
+        def _last_time(data, symbol):
+            obj = data.data[symbol]
+            if isinstance(obj, pd.DataFrame) and "Close" in obj.columns:
+                last = obj["Close"].last_valid_index()
+            else:
+                last = obj.last_valid_index()
+            return last if last is not None else obj.index[0] - freqs[symbol]
+
+        data = self
+        last = {symbol: _last_time(data, symbol) for symbol in data.symbols}
+        pending = {symbol: {} for symbol in data.symbols}
+        stream_kwargs = dict(snapshot=snapshot, reconnect=reconnect)
+        if stream_url is not None:
+            stream_kwargs["stream_url"] = stream_url
+
+        with aperiodic.stream(api_key, channels=list(channels.values()), **stream_kwargs) as live:
+            for message in live:
+                symbol = routes.get((message.channel, message.data.get("symbol")))
+                if symbol is None:
+                    continue
+                row = message.data
+                bar_time = pd.Timestamp(int(row["time"]), unit="us", tz="UTC")
+                if bar_time <= last[symbol]:
+                    continue
+                pending[symbol][bar_time] = {
+                    v: float(row[k]) if row.get(k) is not None else np.nan for k, v in _APERIODIC_COLUMNS.items()
+                }
+
+                cutoff = min(max(pending[s]) if pending[s] else last[s] for s in data.symbols)
+                if all(not any(t <= cutoff for t in pending[s]) for s in data.symbols):
+                    continue
+
+                new_rows = {}
+                for s in data.symbols:
+                    times = sorted(t for t in pending[s] if t <= cutoff)
+                    frame = pd.DataFrame(
+                        [pending[s].pop(t) for t in times],
+                        index=pd.DatetimeIndex(times, name="Open time"),
+                        columns=list(_APERIODIC_COLUMNS.values()),
+                        dtype=float,
+                    )
+                    if backfill and len(times) > 0 and times[0] - last[s] > freqs[s]:
+                        try:
+                            missing = data.download_symbol(
+                                s,
+                                **merge_dicts(
+                                    data.select_symbol_kwargs(s, data.download_kwargs),
+                                    dict(start=last[s] + freqs[s], end=times[0], metrics=None, show_progress=False),
+                                ),
+                            )
+                        except Exception as e:
+                            warnings.warn(f"Could not backfill {s} from REST: {e}", stacklevel=2)
+                        else:
+                            frame = pd.concat((missing[frame.columns], frame), axis=0)
+                    new_rows[s] = frame.reindex(columns=data.data[s].columns)
+                # `Data.update` aligns the new rows of all symbols and lets them overwrite existing rows,
+                # so each symbol re-sends its known rows from the earliest new bar on instead of NaNs
+                first_time = min(frame.index[0] for frame in new_rows.values() if len(frame) > 0)
+                for s, frame in new_rows.items():
+                    known = data.data[s].loc[data.data[s].index >= first_time]
+                    known = known.loc[known.index.difference(frame.index)]
+                    new_rows[s] = pd.concat((known, frame), axis=0).sort_index()
+                data = data.update(rows=symbol_dict(new_rows))
+                last = {s: max(last[s], _last_time(data, s)) for s in data.symbols}
+                yield data
