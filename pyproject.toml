@@ -57,6 +57,7 @@ full = [
     "python-binance",
     "ccxt>=4.0.14",
     "alpaca-py",
+    "aperiodic[pandas,stream]>=4.3.0",
     "ray>=1.4.1",
     "ta",
     "pandas-ta-classic",
